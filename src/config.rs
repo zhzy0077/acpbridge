@@ -421,7 +421,7 @@ channels:
     bots: [bot]
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(config.bots[0].show_auto_approved); // default true
+        assert!(!config.bots[0].show_auto_approved); // default false
     }
 
     #[test]

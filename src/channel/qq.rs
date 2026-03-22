@@ -27,12 +27,9 @@ static QQ_BOT_REGISTRY: LazyLock<DashMap<String, String>> = LazyLock::new(DashMa
 /// QQ Bot channel
 #[derive(Debug)]
 pub struct QqChannel {
-    /// Shared across start() and search_bots_in_chat()
     http_client: HttpClient,
     token_manager: Arc<TokenManager>,
     bot_id_cache: Arc<tokio::sync::OnceCell<Option<String>>>,
-    /// Cache: group_openid (without "group:" prefix) → Vec<bot_ids of bot members>
-    chat_members_cache: DashMap<String, Vec<String>>,
 }
 
 impl QqChannel {
@@ -47,7 +44,6 @@ impl QqChannel {
             http_client,
             token_manager,
             bot_id_cache: Arc::new(tokio::sync::OnceCell::new()),
-            chat_members_cache: DashMap::new(),
         }
     }
 }
@@ -91,7 +87,7 @@ impl Channel for QqChannel {
             QQ_BOT_REGISTRY.insert(id.clone(), channel_name.clone());
             info!(channel = %channel_name, "Registered QQ bot in registry");
         } else {
-            warn!(channel = %channel_name, "Could not fetch QQ bot id; search_bots will be unavailable");
+            warn!(channel = %channel_name, "Could not fetch QQ bot id; mentions will use plain text");
         }
 
         let manager = Arc::new(QqBotManager::new(
@@ -110,44 +106,6 @@ impl Channel for QqChannel {
             .await;
 
         manager.run(outgoing_rx).await
-    }
-
-    async fn search_bots_in_chat(&self, chat_id: &ChatId) -> Vec<String> {
-        let raw_chat_id = match chat_id.0.strip_prefix("group:") {
-            Some(id) => id,
-            None => return vec![],
-        };
-
-        let own_bot_id = self
-            .bot_id_cache
-            .get()
-            .and_then(|o| o.as_deref())
-            .unwrap_or("")
-            .to_string();
-
-        let member_ids = if let Some(cached) = self.chat_members_cache.get(raw_chat_id) {
-            cached.clone()
-        } else {
-            match fetch_group_member_bot_ids(&self.http_client, &self.token_manager, raw_chat_id)
-                .await
-            {
-                Ok(ids) => {
-                    self.chat_members_cache
-                        .insert(raw_chat_id.to_string(), ids.clone());
-                    ids
-                }
-                Err(e) => {
-                    warn!(error = %e, chat_id = %chat_id.0, "Failed to fetch QQ group members");
-                    return vec![];
-                }
-            }
-        };
-
-        member_ids
-            .iter()
-            .filter(|id| id.as_str() != own_bot_id)
-            .filter_map(|id| QQ_BOT_REGISTRY.get(id).map(|e| e.value().clone()))
-            .collect()
     }
 }
 
@@ -765,75 +723,6 @@ fn parse_ws_message<T: serde::de::DeserializeOwned>(msg: &WsMessage) -> Result<T
         }
         _ => Err(anyhow!("Unsupported message type")),
     }
-}
-
-/// Fetch the bot_ids of all bot members in a QQ group.
-async fn fetch_group_member_bot_ids(
-    http_client: &HttpClient,
-    token_manager: &TokenManager,
-    group_openid: &str,
-) -> Result<Vec<String>> {
-    #[derive(Deserialize)]
-    struct GroupMember {
-        member_openid: String,
-        is_bot: Option<bool>,
-    }
-    #[derive(Deserialize)]
-    struct Pagination {
-        has_more: bool,
-        next_token: Option<String>,
-    }
-    #[derive(Deserialize)]
-    struct GroupMembersResp {
-        members: Vec<GroupMember>,
-        pagination: Pagination,
-    }
-
-    let url = format!(
-        "https://api.sgroup.qq.com/v2/groups/{}/members",
-        group_openid
-    );
-    let mut all_bot_ids = Vec::new();
-    let mut next_token: Option<String> = None;
-
-    loop {
-        let token = token_manager.get_token().await?;
-        let mut request = http_client
-            .get(&url)
-            .header("Authorization", format!("QQBot {}", token));
-        if let Some(ref nt) = next_token {
-            request = request.query(&[("next_token", nt.as_str())]);
-        }
-
-        let response = request
-            .send()
-            .await
-            .context("Failed to send group members request")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Group members request failed: {} - {}", status, text));
-        }
-
-        let resp: GroupMembersResp = response
-            .json()
-            .await
-            .context("Failed to parse group members response")?;
-
-        for member in resp.members {
-            if member.is_bot.unwrap_or(false) {
-                all_bot_ids.push(member.member_openid);
-            }
-        }
-
-        if !resp.pagination.has_more {
-            break;
-        }
-        next_token = resp.pagination.next_token;
-    }
-
-    Ok(all_bot_ids)
 }
 
 /// Parse message content and extract command or text

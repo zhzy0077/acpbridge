@@ -27,12 +27,9 @@ static LARK_BOT_REGISTRY: LazyLock<DashMap<String, String>> = LazyLock::new(Dash
 #[derive(Debug)]
 pub struct LarkChannel {
     mention_only: bool,
-    /// Shared across start() and search_bots_in_chat()
     http_client: HttpClient,
     token_manager: Arc<TokenManager>,
     bot_id_cache: Arc<tokio::sync::OnceCell<Option<String>>>,
-    /// Cache: raw_chat_id (without "group:" prefix) → Vec<open_ids of bot members>
-    chat_members_cache: DashMap<String, Vec<String>>,
 }
 
 impl LarkChannel {
@@ -49,7 +46,6 @@ impl LarkChannel {
             http_client,
             token_manager,
             bot_id_cache: Arc::new(tokio::sync::OnceCell::new()),
-            chat_members_cache: DashMap::new(),
         }
     }
 }
@@ -67,7 +63,7 @@ impl Channel for LarkChannel {
             LARK_BOT_REGISTRY.insert(open_id, channel_name.clone());
             info!(channel = %channel_name, "Registered Lark bot in registry");
         } else {
-            warn!(channel = %channel_name, "Could not fetch Lark bot open_id; search_bots will be unavailable");
+            warn!(channel = %channel_name, "Could not fetch Lark bot open_id; mentions will use plain text");
         }
 
         let manager = Arc::new(LarkBotManager::new(
@@ -88,45 +84,6 @@ impl Channel for LarkChannel {
             .await;
 
         manager.run(outgoing_rx).await
-    }
-
-    async fn search_bots_in_chat(&self, chat_id: &ChatId) -> Vec<String> {
-        let raw_chat_id = match chat_id.0.strip_prefix("group:") {
-            Some(id) => id,
-            None => return vec![], // p2p chats never have multiple bots
-        };
-
-        let own_open_id = self
-            .bot_id_cache
-            .get()
-            .and_then(|o| o.as_deref())
-            .unwrap_or("")
-            .to_string();
-
-        // Check cache first
-        let member_ids = if let Some(cached) = self.chat_members_cache.get(raw_chat_id) {
-            cached.clone()
-        } else {
-            match fetch_chat_member_bot_ids(&self.http_client, &self.token_manager, raw_chat_id)
-                .await
-            {
-                Ok(ids) => {
-                    self.chat_members_cache
-                        .insert(raw_chat_id.to_string(), ids.clone());
-                    ids
-                }
-                Err(e) => {
-                    warn!(error = %e, chat_id = %chat_id.0, "Failed to fetch Lark chat members");
-                    return vec![];
-                }
-            }
-        };
-
-        member_ids
-            .iter()
-            .filter(|id| id.as_str() != own_open_id)
-            .filter_map(|id| LARK_BOT_REGISTRY.get(id).map(|e| e.value().clone()))
-            .collect()
     }
 }
 
@@ -564,79 +521,6 @@ async fn get_bot_open_id(
         })
         .await
         .clone()
-}
-
-/// Fetch the open_ids of all bot members in a Lark group chat.
-async fn fetch_chat_member_bot_ids(
-    http_client: &HttpClient,
-    token_manager: &TokenManager,
-    raw_chat_id: &str,
-) -> Result<Vec<String>> {
-    #[derive(Deserialize)]
-    struct MemberItem {
-        member_id: String,
-        member_type: String,
-    }
-    #[derive(Deserialize)]
-    struct MembersData {
-        items: Vec<MemberItem>,
-        page_token: Option<String>,
-        has_more: bool,
-    }
-    #[derive(Deserialize)]
-    struct MembersResp {
-        data: MembersData,
-    }
-
-    let url = format!(
-        "{}/open-apis/im/v1/chats/{}/members",
-        token_manager.base_url, raw_chat_id
-    );
-    let mut all_bot_ids = Vec::new();
-    let mut page_token: Option<String> = None;
-
-    loop {
-        let token = token_manager.get_token().await?;
-        let mut request = http_client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .query(&[("member_id_type", "open_id")]);
-        if let Some(ref pt) = page_token {
-            request = request.query(&[("page_token", pt.as_str())]);
-        }
-
-        let response = request
-            .send()
-            .await
-            .context("Failed to send chat members request")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Chat members request failed: {} - {}", status, text));
-        }
-
-        let body = response
-            .text()
-            .await
-            .context("Failed to read chat members response body")?;
-        tracing::debug!(body = %body, "Chat members raw response");
-        let resp: MembersResp = serde_json::from_str(&body)
-            .with_context(|| format!("Failed to parse chat members response: {}", body))?;
-
-        for member in resp.data.items {
-            if member.member_type == "bot" {
-                all_bot_ids.push(member.member_id);
-            }
-        }
-
-        if !resp.data.has_more {
-            break;
-        }
-        page_token = resp.data.page_token;
-    }
-
-    Ok(all_bot_ids)
 }
 
 fn message_mentions_bot(text: &str, mentions: &[MentionEntry], bot_open_id: &str) -> bool {

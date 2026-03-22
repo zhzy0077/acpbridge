@@ -101,11 +101,6 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                // Register for search_bots_in_chat
-                orchestrator
-                    .register_channel(channel_name.clone(), channel.clone())
-                    .await;
-
                 let orch = orchestrator.clone();
                 let mb = message_bus.clone();
                 let name = channel_name.clone();

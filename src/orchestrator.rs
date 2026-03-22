@@ -395,13 +395,15 @@ impl Orchestrator {
 
         for (key, _) in running.iter() {
             let (_, ref cid, ref bot_name) = *key;
-            if cid == chat_id && bot_name != caller_bot && seen.insert(bot_name.clone()) {
-                if let Some(b) = self.config.get_bot(bot_name) {
-                    result.push(BotInfo {
-                        name: b.name.clone(),
-                        description: b.description.clone(),
-                    });
-                }
+            if cid == chat_id
+                && bot_name != caller_bot
+                && seen.insert(bot_name.clone())
+                && let Some(b) = self.config.get_bot(bot_name)
+            {
+                result.push(BotInfo {
+                    name: b.name.clone(),
+                    description: b.description.clone(),
+                });
             }
         }
         drop(running);

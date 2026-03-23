@@ -1,12 +1,6 @@
 //! ACP Connector - Bridge between messaging platforms and ACP Agent CLI
 
-mod acp_client;
-mod bot;
-mod channel;
-mod config;
-mod mcp_server;
-mod message_bus;
-mod orchestrator;
+use acpbridge::{config, channel, message_bus, orchestrator, mcp_server};
 
 use anyhow::Result;
 use std::path::PathBuf;

@@ -1,4 +1,4 @@
-# ACP Connector
+# ACP Bridge
 
 Bridge between messaging platforms and AI agents via the **Agent Client Protocol (ACP)**. Chat with Claude, Gemini, or any ACP-compatible agent directly from Telegram, QQ, Lark/Feishu, or WeChat.
 

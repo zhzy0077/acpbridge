@@ -7,7 +7,6 @@ use std::path::PathBuf;
 /// Root configuration structure
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    pub mcp_server: Option<McpServerConfig>,
     /// Bot definitions (top-level, reusable)
     pub bots: Vec<BotConfig>,
     /// Channel definitions (top-level, references bots by name)
@@ -70,9 +69,6 @@ pub struct ChannelConfig {
     pub default_bot: Option<String>,
     /// List of bot names available on this channel
     pub bots: Vec<String>,
-    /// If true, group-chat text is only forwarded when the bot is mentioned
-    #[serde(default)]
-    pub mention_only: bool,
 }
 
 /// Platform-specific configuration (enum, one variant per platform)
@@ -91,12 +87,6 @@ pub enum PlatformConfig {
     Qq { qq: QqConfig },
     Lark { lark: LarkConfig },
     Wechat { wechat: WeChatConfig },
-}
-
-/// MCP Server configuration
-#[derive(Debug, Clone, Deserialize)]
-pub struct McpServerConfig {
-    pub port: u16,
 }
 
 /// Agent process configuration
@@ -257,7 +247,6 @@ channels:
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.bots.len(), 2);
         assert_eq!(config.channels[0].bots.len(), 2);
-        assert!(!config.channels[0].mention_only);
     }
 
     #[test]
@@ -387,24 +376,6 @@ channels:
             config.bots[0].config_options.get("custom_selector"),
             Some(&"enabled".to_string())
         );
-    }
-
-    #[test]
-    fn test_parse_mention_only() {
-        let yaml = r#"
-bots:
-  - name: bot
-    agent:
-      command: claude-code
-channels:
-  - name: ch
-    telegram:
-      token: "xxx"
-    bots: [bot]
-    mention_only: true
-"#;
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
-        assert!(config.channels[0].mention_only);
     }
 
     #[test]

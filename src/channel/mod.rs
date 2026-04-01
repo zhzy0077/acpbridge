@@ -56,14 +56,6 @@ pub enum OutgoingContent {
     StreamEnd,
     /// An error message to send to the user
     Error(String),
-    /// Mention another bot by name — each Channel formats this into its native @mention syntax.
-    /// `target_channel_name` is the config channel name of the target bot; channels with a
-    /// static bot registry use it to look up the target's platform ID.
-    Mention {
-        target_bot: String,
-        target_channel_name: Option<String>,
-        message: String,
-    },
 }
 
 impl IncomingMessage {
@@ -82,33 +74,20 @@ impl IncomingMessage {
     }
 }
 
-pub(crate) fn should_dispatch_message(
-    mention_only: bool,
-    is_group_chat: bool,
-    is_mentioned: bool,
-) -> bool {
-    !mention_only || !is_group_chat || is_mentioned
-}
-
 /// Channel trait for messaging platform implementations
 ///
 /// Implementors must:
-/// - Start an async task that receives messages and sends them via `incoming_tx`
+/// - Start an async task that receives messages and sends them via `Ingress::handle_message()`
 /// - Listen on `outgoing_rx` and forward messages to users
+/// - Register their outgoing sender with `Egress::register_channel()`
 /// - Clean up gracefully when the future is cancelled
 #[async_trait::async_trait]
 pub trait Channel: Send + Sync {
-    /// Start the channel and begin processing messages
-    ///
-    /// # Arguments
-    /// * `channel_name` - The unique name of this channel (from config)
-    /// * `orchestrator` - The orchestrator for getting/creating bots
-    /// * `message_bus` - The message bus for routing messages
     async fn start(
         &self,
+        ingress: std::sync::Arc<crate::ingress::Ingress>,
+        egress: std::sync::Arc<crate::egress::Egress>,
         channel_name: String,
-        orchestrator: std::sync::Arc<crate::orchestrator::Orchestrator>,
-        message_bus: std::sync::Arc<crate::message_bus::MessageBus>,
     ) -> anyhow::Result<()>;
 }
 
@@ -161,26 +140,6 @@ mod tests {
             }
             _ => panic!("Expected Command content"),
         }
-    }
-
-    #[test]
-    fn test_should_dispatch_private_message_when_mention_only_enabled() {
-        assert!(should_dispatch_message(true, false, false));
-    }
-
-    #[test]
-    fn test_should_dispatch_mentioned_group_message_when_mention_only_enabled() {
-        assert!(should_dispatch_message(true, true, true));
-    }
-
-    #[test]
-    fn test_should_block_unmentioned_group_message_when_mention_only_enabled() {
-        assert!(!should_dispatch_message(true, true, false));
-    }
-
-    #[test]
-    fn test_should_block_unmentioned_group_command_when_mention_only_enabled() {
-        assert!(!should_dispatch_message(true, true, false));
     }
 
     #[test]

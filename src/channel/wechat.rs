@@ -4,10 +4,11 @@
 //! Supports personal WeChat messaging via the iLink protocol.
 
 use crate::channel::{
-    should_dispatch_message, Channel, ChatId, IncomingContent, IncomingMessage, OutgoingContent,
-    OutgoingMessage,
+    Channel, ChatId, IncomingContent, IncomingMessage, OutgoingContent, OutgoingMessage,
 };
-use crate::message_bus::BotInstanceKey;
+use crate::ingress::Ingress;
+use crate::egress::Egress;
+use crate::message::{IngressMessage, IngressContent};
 use dashmap::DashMap;
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
@@ -35,10 +36,10 @@ const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
 const POLL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Stream buffer timeout (30 seconds)
 const STREAM_TIMEOUT: Duration = Duration::from_secs(30);
+/// Flush long stream buffers incrementally.
+const STREAM_FLUSH_THRESHOLD: usize = 500;
 /// Maximum message length for WeChat (roughly 2000 chars to be safe)
 const MAX_MESSAGE_LENGTH: usize = 2000;
-/// Typing ticket TTL (24 hours)
-const TYPING_TICKET_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Channel version for base_info
 const CHANNEL_VERSION: &str = "acpconnector-0.1.0";
 /// Message type constants
@@ -70,52 +71,35 @@ impl WeChatConfig {
 #[derive(Debug, Clone)]
 pub struct WeChatChannel {
     config: WeChatConfig,
-    mention_only: bool,
 }
 
 impl WeChatChannel {
-    pub fn new(config: WeChatConfig, mention_only: bool) -> Self {
-        Self {
-            config,
-            mention_only,
-        }
+    pub fn new(config: WeChatConfig) -> Self {
+        Self { config }
     }
-}
-
-/// Typing ticket cache entry
-struct TypingTicketEntry {
-    ticket: String,
-    expiry: Instant,
 }
 
 #[async_trait::async_trait]
 impl Channel for WeChatChannel {
     async fn start(
         &self,
+        ingress: Arc<Ingress>,
+        egress: Arc<Egress>,
         channel_name: String,
-        orchestrator: Arc<crate::orchestrator::Orchestrator>,
-        message_bus: Arc<crate::message_bus::MessageBus>,
     ) -> anyhow::Result<()> {
-        // Create shared HTTP client to leverage connection pooling
         let http_client = Arc::new(HttpClient::new());
         let context_tokens: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
-        let typing_tickets: Arc<DashMap<String, TypingTicketEntry>> = Arc::new(DashMap::new());
 
-        // Create outgoing channel and register with MessageBus
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<(ChatId, OutgoingMessage)>(100);
-        message_bus
+        egress
             .register_channel(channel_name.clone(), outgoing_tx)
             .await;
 
-        // Spawn long-poll loop for incoming messages
         let poll_client = http_client.clone();
         let poll_config = self.config.clone();
         let poll_context_tokens = context_tokens.clone();
-        let poll_typing_tickets = typing_tickets.clone();
-        let poll_orchestrator = orchestrator.clone();
-        let poll_message_bus = message_bus.clone();
+        let poll_ingress = ingress.clone();
         let poll_channel_name = channel_name.clone();
-        let poll_mention_only = self.mention_only;
 
         let poll_handle = tokio::spawn(async move {
             let mut retry_delay = Duration::from_secs(1);
@@ -126,11 +110,8 @@ impl Channel for WeChatChannel {
                     http_client: &poll_client,
                     config: &poll_config,
                     context_tokens: &poll_context_tokens,
-                    typing_tickets: &poll_typing_tickets,
-                    orchestrator: &poll_orchestrator,
-                    message_bus: &poll_message_bus,
+                    ingress: &poll_ingress,
                     channel_name: &poll_channel_name,
-                    mention_only: poll_mention_only,
                 };
                 match run_poll_loop(&ctx).await
                 {
@@ -148,7 +129,6 @@ impl Channel for WeChatChannel {
             }
         });
 
-        // Handle outgoing messages
         let outgoing_client = http_client.clone();
         let outgoing_config = self.config.clone();
         let outgoing_context_tokens = context_tokens.clone();
@@ -171,16 +151,12 @@ impl Channel for WeChatChannel {
     }
 }
 
-/// Context shared across WeChat operations
 struct WeChatContext<'a> {
     http_client: &'a HttpClient,
     config: &'a WeChatConfig,
     context_tokens: &'a Arc<DashMap<String, String>>,
-    typing_tickets: &'a Arc<DashMap<String, TypingTicketEntry>>,
-    orchestrator: &'a Arc<crate::orchestrator::Orchestrator>,
-    message_bus: &'a Arc<crate::message_bus::MessageBus>,
+    ingress: &'a Arc<Ingress>,
     channel_name: &'a str,
-    mention_only: bool,
 }
 
 /// Run the long-poll loop for receiving messages
@@ -251,7 +227,7 @@ async fn run_poll_loop(ctx: &WeChatContext<'_>) -> anyhow::Result<()> {
                     error!(
                         ret = ?body.ret,
                         errcode = ?body.errcode,
-                        errmsg = ?body.errmsg,
+                        errmsg = ?body._errmsg,
                         "WeChat API error in getUpdates"
                     );
                     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -279,17 +255,14 @@ async fn run_poll_loop(ctx: &WeChatContext<'_>) -> anyhow::Result<()> {
     }
 }
 
-/// Process a single incoming WeChat message
 async fn process_incoming_message(
     msg: &WeixinMessage,
     ctx: &WeChatContext<'_>,
 ) -> anyhow::Result<()> {
-    // Only process user messages
     if msg.message_type != MSG_TYPE_USER {
         return Ok(());
     }
 
-    // Extract user ID and store context token
     let user_id = msg.from_user_id.clone();
     if !msg.context_token.is_empty() {
         ctx.context_tokens.insert(user_id.clone(), msg.context_token.clone());
@@ -297,59 +270,19 @@ async fn process_incoming_message(
 
     let chat_id = ChatId(user_id.clone());
 
-    // WeChat personal chat is always 1-on-1, so is_group_chat is always false
-    let is_group_chat = false;
-    let is_mentioned = false;
-
-    if !should_dispatch_message(ctx.mention_only, is_group_chat, is_mentioned) {
-        return Ok(());
-    }
-
-    // Extract text content from message items
     let content = extract_message_content(msg);
-    let incoming = parse_incoming(&content);
+    let normalized = normalize_content(&content);
 
-    // Check for /bot command
-    if let IncomingContent::Command {
-        name: cmd_name,
-        args,
-    } = &incoming.content
-        && cmd_name == "bot"
-    {
-        ctx.orchestrator
-            .handle_bot_command(ctx.channel_name, &chat_id, args.clone())
-            .await?;
-        return Ok(());
-    }
-
-    // Get or create bot and dispatch
-    match ctx.orchestrator.get_or_create(ctx.channel_name, &chat_id).await {
-        Some(bot_name) => {
-            // Send typing indicator to show bot is processing
-            let chat_id_str = chat_id.0.clone();
-            let context_token = ctx.context_tokens.get(&chat_id_str).map(|t| t.clone());
-
-            if let Err(e) = send_typing_with_ticket(
-                ctx.http_client,
-                ctx.config,
-                ctx.typing_tickets,
-                &chat_id_str,
-                context_token.as_deref(),
-            ).await {
-                debug!(error = %e, chat_id = %chat_id_str, "Failed to send typing indicator");
-            }
-
-            let key = BotInstanceKey {
-                channel_name: ctx.channel_name.to_string(),
-                chat_id: chat_id.clone(),
-                bot_name,
-            };
-            ctx.message_bus.dispatch(&key, incoming).await?;
-        }
-        None => {
-            error!("Failed to get or create bot for chat");
-        }
-    }
+    let incoming = parse_incoming(&normalized);
+    let ingress_msg = IngressMessage {
+        channel_name: ctx.channel_name.to_string(),
+        chat_id: chat_id.clone(),
+        content: match incoming.content {
+            IncomingContent::Text(text) => IngressContent::Text(text),
+            IncomingContent::Command { name, args } => IngressContent::Command { name, args },
+        },
+    };
+    ctx.ingress.handle_message(ingress_msg).await;
 
     Ok(())
 }
@@ -386,7 +319,6 @@ fn extract_message_content(msg: &WeixinMessage) -> String {
     parts.join("\n")
 }
 
-/// Parse incoming text into message or command
 fn parse_incoming(text: &str) -> IncomingMessage {
     let text = text.trim();
     if let Some(rest) = text.strip_prefix('/') {
@@ -397,6 +329,10 @@ fn parse_incoming(text: &str) -> IncomingMessage {
     } else {
         IncomingMessage::text(text.to_string())
     }
+}
+
+fn normalize_content(text: &str) -> String {
+    text.trim().to_string()
 }
 
 /// Handle outgoing messages
@@ -430,15 +366,31 @@ async fn handle_outgoing_messages(
                         }
                     }
                     OutgoingContent::StreamChunk(text) => {
-                        // Buffer mode: accumulate chunks
                         let now = Instant::now();
-                        stream_buffers
-                            .entry(chat_id_str)
+                        let should_flush = {
+                            let entry = stream_buffers
+                            .entry(chat_id_str.clone())
                             .and_modify(|(buf, ts)| {
                                 buf.push_str(&text);
                                 *ts = now;
                             })
                             .or_insert((text, now));
+                            entry.0.chars().count() >= STREAM_FLUSH_THRESHOLD
+                        };
+
+                        if should_flush
+                            && let Some((content, _)) = stream_buffers.remove(&chat_id.0)
+                            && !content.is_empty()
+                            && let Err(e) = send_text_message(
+                                http_client,
+                                config,
+                                context_tokens,
+                                &chat_id,
+                                &content,
+                            ).await
+                        {
+                            error!(error = %e, chat_id = %chat_id_str, "Failed to flush stream chunk");
+                        }
                     }
                     OutgoingContent::StreamEnd => {
                         // Stream end: send buffered content
@@ -465,19 +417,6 @@ async fn handle_outgoing_messages(
                             &content,
                         ).await {
                             error!(error = %e, chat_id = %chat_id_str, "Failed to send error");
-                        }
-                    }
-                    OutgoingContent::Mention { target_bot, message, .. } => {
-                        // WeChat doesn't have native bot mention format
-                        let full_message = format!("@{} {}", target_bot, message);
-                        if let Err(e) = send_text_message(
-                            http_client,
-                            config,
-                            context_tokens,
-                            &chat_id,
-                            &full_message,
-                        ).await {
-                            error!(error = %e, chat_id = %chat_id_str, "Failed to send mention");
                         }
                     }
                 }
@@ -530,51 +469,55 @@ async fn send_text_message(
         }
     };
 
-    // Truncate if too long
-    let content = if content.chars().count() > MAX_MESSAGE_LENGTH {
-        let truncated: String = content.chars().take(MAX_MESSAGE_LENGTH - 3).collect();
-        format!("{}...", truncated)
+    let parts: Vec<String> = if content.chars().count() > MAX_MESSAGE_LENGTH {
+        content
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(MAX_MESSAGE_LENGTH)
+            .map(|chunk| chunk.iter().collect())
+            .collect()
     } else {
-        content.to_string()
+        vec![content.to_string()]
     };
 
-    // Build message items
-    let item = MessageItem {
-        item_type: MSG_ITEM_TEXT,
-        text_item: Some(TextItem { text: content }),
-        voice_item: None,
-        ref_msg: None,
-    };
+    for part in parts {
+        let item = MessageItem {
+            item_type: MSG_ITEM_TEXT,
+            text_item: Some(TextItem { text: part }),
+            voice_item: None,
+            ref_msg: None,
+        };
 
-    let request = SendMessageRequest {
-        msg: MessagePayload {
-            from_user_id: String::new(),
-            to_user_id: chat_id.0.clone(),
-            client_id: generate_client_id(),
-            message_type: MSG_TYPE_BOT,
-            message_state: MSG_STATE_FINISH,
-            context_token,
-            item_list: vec![item],
-        },
-        base_info: BaseInfo {
-            channel_version: CHANNEL_VERSION.to_string(),
-        },
-    };
+        let request = SendMessageRequest {
+            msg: MessagePayload {
+                from_user_id: String::new(),
+                to_user_id: chat_id.0.clone(),
+                client_id: generate_client_id(),
+                message_type: MSG_TYPE_BOT,
+                message_state: MSG_STATE_FINISH,
+                context_token: context_token.clone(),
+                item_list: vec![item],
+            },
+            base_info: BaseInfo {
+                channel_version: CHANNEL_VERSION.to_string(),
+            },
+        };
 
-    let response = http_client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("AuthorizationType", "ilink_bot_token")
-        .header("Authorization", format!("Bearer {}", config.bot_token))
-        .header("X-WECHAT-UIN", generate_uin_header())
-        .json(&request)
-        .send()
-        .await?;
+        let response = http_client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("AuthorizationType", "ilink_bot_token")
+            .header("Authorization", format!("Bearer {}", config.bot_token))
+            .header("X-WECHAT-UIN", generate_uin_header())
+            .json(&request)
+            .send()
+            .await?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("Send message failed: {} - {}", status, text));
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!("Send message failed: {} - {}", status, text));
+        }
     }
 
     debug!(chat_id = %chat_id.0, "Message sent successfully");
@@ -618,123 +561,6 @@ async fn check_and_flush_timeouts(
 
 
 
-/// Fetch typing ticket from getConfig API
-async fn fetch_typing_ticket(
-    http_client: &HttpClient,
-    config: &WeChatConfig,
-    user_id: &str,
-    context_token: &str,
-) -> anyhow::Result<String> {
-    let url = format!("{}/ilink/bot/getconfig", config.base_url);
-    
-    let request = serde_json::json!({
-        "ilink_user_id": user_id,
-        "context_token": context_token,
-        "base_info": { "channel_version": CHANNEL_VERSION }
-    });
-
-    let response = http_client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("AuthorizationType", "ilink_bot_token")
-        .header("Authorization", format!("Bearer {}", config.bot_token))
-        .header("X-WECHAT-UIN", generate_uin_header())
-        .json(&request)
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("Get config failed: {} - {}", status, text));
-    }
-
-    let body: GetConfigResponse = response.json().await?;
-    
-    if let Some(ticket) = body.typing_ticket
-        && !ticket.is_empty()
-    {
-        return Ok(ticket);
-    }
-
-    Err(anyhow::anyhow!("No typing_ticket in getConfig response"))
-}
-
-/// Send typing indicator to WeChat with ticket caching
-async fn send_typing_with_ticket(
-    http_client: &HttpClient,
-    config: &WeChatConfig,
-    typing_tickets: &Arc<DashMap<String, TypingTicketEntry>>,
-    to_user_id: &str,
-    context_token: Option<&str>,
-) -> anyhow::Result<()> {
-    // Check cache first
-    if let Some(entry) = typing_tickets.get(to_user_id)
-        && entry.expiry > Instant::now()
-    {
-        // Use cached ticket
-        return send_typing(http_client, config, to_user_id, &entry.ticket).await;
-    }
-
-    // Fetch new ticket
-    let context_token = match context_token {
-        Some(t) if !t.is_empty() => t,
-        _ => return Err(anyhow::anyhow!("context_token required for typing indicator")),
-    };
-
-    match fetch_typing_ticket(http_client, config, to_user_id, context_token).await {
-        Ok(ticket) => {
-            // Cache the ticket
-            typing_tickets.insert(
-                to_user_id.to_string(),
-                TypingTicketEntry {
-                    ticket: ticket.clone(),
-                    expiry: Instant::now() + TYPING_TICKET_TTL,
-                },
-            );
-            // Send typing indicator
-            send_typing(http_client, config, to_user_id, &ticket).await
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// Send typing indicator to WeChat
-async fn send_typing(
-    http_client: &HttpClient,
-    config: &WeChatConfig,
-    to_user_id: &str,
-    typing_ticket: &str,
-) -> anyhow::Result<()> {
-    let url = format!("{}/ilink/bot/sendtyping", config.base_url);
-
-    let request = serde_json::json!({
-        "ilink_user_id": to_user_id,
-        "typing_ticket": typing_ticket,
-        "status": 1,
-        "base_info": { "channel_version": CHANNEL_VERSION }
-    });
-
-    let response = http_client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("AuthorizationType", "ilink_bot_token")
-        .header("Authorization", format!("Bearer {}", config.bot_token))
-        .header("X-WECHAT-UIN", generate_uin_header())
-        .json(&request)
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("Send typing failed: {} - {}", status, text));
-    }
-
-    debug!(user_id = %to_user_id, "Typing indicator sent");
-    Ok(())
-}
-
 // ============================================================================
 // API Types
 // ============================================================================
@@ -746,47 +572,32 @@ struct GetUpdatesRequest {
     get_updates_buf: Option<String>,
 }
 
-/// Response body for getConfig
-#[derive(Debug, Deserialize)]
-struct GetConfigResponse {
-    #[allow(dead_code)]
-    ret: Option<i64>,
-    #[allow(dead_code)]
-    errmsg: Option<String>,
-    #[serde(default)]
-    typing_ticket: Option<String>,
-}
-
 /// Response body for getUpdates
 #[derive(Debug, Deserialize)]
 struct GetUpdatesResponse {
     ret: Option<i64>,
     errcode: Option<i64>,
-    #[allow(dead_code)]
-    errmsg: Option<String>,
+    #[serde(default)]
+    _errmsg: Option<String>,
     #[serde(default)]
     msgs: Vec<WeixinMessage>,
     #[serde(rename = "get_updates_buf")]
     get_updates_buf: Option<String>,
-    #[allow(dead_code)]
-    #[serde(rename = "longpolling_timeout_ms")]
-    longpolling_timeout_ms: Option<u64>,
+    #[serde(rename = "longpolling_timeout_ms", default)]
+    _longpolling_timeout_ms: Option<u64>,
 }
 
 /// WeChat message structure
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct WeixinMessage {
     #[serde(default)]
     from_user_id: String,
     #[serde(default)]
-    #[allow(dead_code)]
-    to_user_id: String,
+    _to_user_id: String,
     #[serde(default)]
     message_type: i64,
-    #[allow(dead_code)]
     #[serde(default)]
-    message_state: i64,
+    _message_state: i64,
     #[serde(default)]
     context_token: String,
     #[serde(default)]
@@ -863,33 +674,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_incoming_text() {
-        let incoming = parse_incoming("hello");
-        match incoming.content {
-            IncomingContent::Text(text) => assert_eq!(text, "hello"),
-            _ => panic!("Expected text"),
-        }
+    fn test_normalize_content_text() {
+        let content = normalize_content("hello");
+        assert_eq!(content, "hello");
     }
 
     #[test]
-    fn test_parse_incoming_command() {
-        let incoming = parse_incoming("/model gpt-4");
-        match incoming.content {
-            IncomingContent::Command { name, args } => {
-                assert_eq!(name, "model");
-                assert_eq!(args, Some("gpt-4".to_string()));
-            }
-            _ => panic!("Expected command"),
-        }
+    fn test_normalize_content_command() {
+        let content = normalize_content("/model gpt-4");
+        assert_eq!(content, "/model gpt-4");
     }
 
     #[test]
     fn test_extract_message_content_text() {
         let msg = WeixinMessage {
             from_user_id: "user123".to_string(),
-            to_user_id: "bot456".to_string(),
+            _to_user_id: "bot456".to_string(),
             message_type: MSG_TYPE_USER,
-            message_state: 0,
+            _message_state: 0,
             context_token: "token".to_string(),
             item_list: vec![MessageItem {
                 item_type: MSG_ITEM_TEXT,
@@ -905,29 +707,27 @@ mod tests {
     fn test_extract_message_content_with_ref() {
         let msg = WeixinMessage {
             from_user_id: "user123".to_string(),
-            to_user_id: "bot456".to_string(),
+            _to_user_id: "bot456".to_string(),
             message_type: MSG_TYPE_USER,
-            message_state: 0,
+            _message_state: 0,
             context_token: "token".to_string(),
             item_list: vec![MessageItem {
                 item_type: MSG_ITEM_TEXT,
                 text_item: Some(TextItem { text: "my reply".to_string() }),
                 voice_item: None,
-                ref_msg: Some(RefMsg { title: "original message".to_string() }),
+                ref_msg: Some(RefMsg { title: "original".to_string() }),
             }],
         };
-        let text = extract_message_content(&msg);
-        assert!(text.contains("my reply"));
-        assert!(text.contains("> original message"));
+        assert_eq!(extract_message_content(&msg), "my reply\n> original");
     }
 
     #[test]
     fn test_extract_message_content_voice() {
         let msg = WeixinMessage {
             from_user_id: "user123".to_string(),
-            to_user_id: "bot456".to_string(),
+            _to_user_id: "bot456".to_string(),
             message_type: MSG_TYPE_USER,
-            message_state: 0,
+            _message_state: 0,
             context_token: "token".to_string(),
             item_list: vec![MessageItem {
                 item_type: MSG_ITEM_VOICE,

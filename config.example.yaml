@@ -2,10 +2,6 @@
 #
 # Copy this file to config.yaml and update with your settings
 
-# Optional: MCP Server configuration
-# mcp_server:
-#   port: 8080
-
 # Bot definitions - top-level, reusable across channels
 bots:
   # Example: Claude Code bot
@@ -55,8 +51,6 @@ channels:
     telegram:
       # Replace with your Telegram bot token from @BotFather
       token: "YOUR_TELEGRAM_BOT_TOKEN"
-    # When enabled, group-chat text is forwarded to ACP only if the bot is mentioned
-    mention_only: false
     # Default bot for new chats
     default_bot: plan-agent
     # Bots available on this channel (users can switch with /bot command)
@@ -68,7 +62,6 @@ channels:
   #   qq:
   #     app_id: "YOUR_QQ_BOT_APP_ID"
   #     client_secret: "YOUR_QQ_BOT_CLIENT_SECRET"
-  #   mention_only: false
   #   default_bot: plan-agent
   #   bots: [plan-agent]
 
@@ -80,6 +73,5 @@ channels:
   #     app_secret: "YOUR_LARK_APP_SECRET"
   #     # Optional: Base URL (default: https://open.feishu.cn)
   #     # base_url: "https://open.larksuite.com"  # For Lark International
-  #   mention_only: false
   #   default_bot: plan-agent
   #   bots: [plan-agent, execute-agent]

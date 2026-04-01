@@ -4,9 +4,11 @@
 //! Supports C2C (single chat) and Group (@bot) message scenarios.
 
 use crate::channel::{
-    Channel, ChatId, IncomingContent, IncomingMessage, OutgoingContent, OutgoingMessage,
+    Channel, ChatId, IncomingContent, OutgoingContent, OutgoingMessage,
 };
-use crate::message_bus::BotInstanceKey;
+use crate::ingress::Ingress;
+use crate::egress::Egress;
+use crate::message::{IngressContent, IngressMessage};
 use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
@@ -33,7 +35,7 @@ pub struct QqChannel {
 }
 
 impl QqChannel {
-    pub fn new(app_id: String, client_secret: String, _mention_only: bool) -> Self {
+    pub fn new(app_id: String, client_secret: String) -> Self {
         let http_client = HttpClient::new();
         let token_manager = Arc::new(TokenManager::new(
             app_id,
@@ -52,11 +54,10 @@ impl QqChannel {
 impl Channel for QqChannel {
     async fn start(
         &self,
+        ingress: Arc<Ingress>,
+        egress: Arc<Egress>,
         channel_name: String,
-        orchestrator: Arc<crate::orchestrator::Orchestrator>,
-        message_bus: Arc<crate::message_bus::MessageBus>,
     ) -> Result<()> {
-        // Eagerly register own bot_id so peers can discover us via QQ_BOT_REGISTRY
         let bot_id = self
             .bot_id_cache
             .get_or_init(|| async {
@@ -92,39 +93,33 @@ impl Channel for QqChannel {
 
         let manager = Arc::new(QqBotManager::new(
             channel_name,
-            orchestrator,
-            message_bus,
+            ingress,
+            egress,
             self.http_client.clone(),
             self.token_manager.clone(),
         ));
 
-        // Create outgoing channel and register with MessageBus
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<(ChatId, OutgoingMessage)>(100);
-        manager
-            .message_bus
-            .register_channel(manager.channel_name.clone(), outgoing_tx)
-            .await;
+        manager.egress.register_channel(manager.channel_name.clone(), outgoing_tx).await;
 
         manager.run(outgoing_rx).await
     }
 }
 
-/// QQ Bot connection manager
 struct QqBotManager {
     http_client: HttpClient,
     token_manager: Arc<TokenManager>,
     channel_name: String,
-    orchestrator: Arc<crate::orchestrator::Orchestrator>,
-    message_bus: Arc<crate::message_bus::MessageBus>,
-    /// Recent message IDs for passive reply (chat_id -> msg_id)
+    ingress: Arc<Ingress>,
+    egress: Arc<Egress>,
     recent_msg_ids: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl QqBotManager {
     fn new(
         channel_name: String,
-        orchestrator: Arc<crate::orchestrator::Orchestrator>,
-        message_bus: Arc<crate::message_bus::MessageBus>,
+        ingress: Arc<Ingress>,
+        egress: Arc<Egress>,
         http_client: HttpClient,
         token_manager: Arc<TokenManager>,
     ) -> Self {
@@ -132,8 +127,8 @@ impl QqBotManager {
             http_client,
             token_manager,
             channel_name,
-            orchestrator,
-            message_bus,
+            ingress,
+            egress,
             recent_msg_ids: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -141,12 +136,11 @@ impl QqBotManager {
     async fn run(&self, mut outgoing_rx: mpsc::Receiver<(ChatId, OutgoingMessage)>) -> Result<()> {
         let token_manager = self.token_manager.clone();
         let channel_name = self.channel_name.clone();
-        let orchestrator = self.orchestrator.clone();
-        let message_bus = self.message_bus.clone();
+        let ingress = self.ingress.clone();
+        let _egress = self.egress.clone();
         let recent_msg_ids = self.recent_msg_ids.clone();
         let session_state = Arc::new(SessionState::new());
 
-        // Spawn WebSocket connection task
         let ws_handle = tokio::spawn(async move {
             let mut reconnect_delay = Duration::from_secs(1);
             const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
@@ -155,8 +149,7 @@ impl QqBotManager {
                 match run_websocket_connection(
                     &token_manager,
                     &channel_name,
-                    &orchestrator,
-                    &message_bus,
+                    &ingress,
                     &recent_msg_ids,
                     &session_state,
                 )
@@ -248,31 +241,6 @@ impl QqBotManager {
                                     &recent_msg_ids,
                                 ).await {
                                     error!(error = %e, chat_id = %chat_id_str, "Failed to send error");
-                                }
-                            }
-                            OutgoingContent::Mention { target_bot, target_channel_name, message } => {
-                                // Look up target's bot_id via the static registry
-                                let bot_id = target_channel_name.as_deref().and_then(|cn| {
-                                    QQ_BOT_REGISTRY
-                                        .iter()
-                                        .find(|e| e.value() == cn)
-                                        .map(|e| e.key().clone())
-                                });
-                                let full_message = match bot_id {
-                                    Some(id) => format!("<@!{}> {}", id, message),
-                                    None => {
-                                        warn!(target_bot = %target_bot, "Target bot id not in QQ registry, falling back to plain mention");
-                                        format!("@{} {}", target_bot, message)
-                                    }
-                                };
-                                if let Err(e) = send_message(
-                                    &http_client,
-                                    &token_manager,
-                                    &chat_id,
-                                    &full_message,
-                                    &recent_msg_ids,
-                                ).await {
-                                    error!(error = %e, chat_id = %chat_id_str, "Failed to send mention");
                                 }
                             }
                         }
@@ -470,8 +438,7 @@ const INTENTS: u32 = 1 << 25; // GROUP_AND_C2C_EVENT
 async fn run_websocket_connection(
     token_manager: &TokenManager,
     channel_name: &str,
-    orchestrator: &Arc<crate::orchestrator::Orchestrator>,
-    message_bus: &Arc<crate::message_bus::MessageBus>,
+    ingress: &Arc<crate::ingress::Ingress>,
     recent_msg_ids: &Arc<RwLock<HashMap<String, String>>>,
     session_state: &Arc<SessionState>,
 ) -> Result<()> {
@@ -647,8 +614,7 @@ async fn run_websocket_connection(
                                     if let Err(e) = handle_event(
                                         &payload,
                                         channel_name,
-                                        orchestrator,
-                                        message_bus,
+                                        ingress,
                                         recent_msg_ids,
                                     ).await {
                                         error!(error = %e, "Failed to handle event");
@@ -758,8 +724,7 @@ fn parse_message_content(content: &str) -> IncomingContent {
 async fn handle_event(
     payload: &GatewayPayload,
     channel_name: &str,
-    orchestrator: &Arc<crate::orchestrator::Orchestrator>,
-    message_bus: &Arc<crate::message_bus::MessageBus>,
+    ingress: &Arc<crate::ingress::Ingress>,
     recent_msg_ids: &Arc<RwLock<HashMap<String, String>>>,
 ) -> Result<()> {
     let event_type = payload.event_type.as_deref().unwrap_or("");
@@ -773,43 +738,21 @@ async fn handle_event(
             let msg: QqMessage = serde_json::from_value(data.clone())?;
             let chat_id = ChatId(format!("c2c:{}", msg.author.user_openid));
 
-            // Store message ID for passive reply
             {
                 let mut ids = recent_msg_ids.write().await;
                 ids.insert(chat_id.0.clone(), msg.id.clone());
             }
 
-            let content = parse_message_content(&msg.content);
-
-            // Check for /bot command
-            if let IncomingContent::Command {
-                name: cmd_name,
-                args,
-            } = &content
-                && cmd_name == "bot"
-            {
-                orchestrator
-                    .handle_bot_command(channel_name, &chat_id, args.clone())
-                    .await?;
-                return Ok(());
-            }
-
-            // Get or create bot and dispatch
-            match orchestrator.get_or_create(channel_name, &chat_id).await {
-                Some(bot_name) => {
-                    let key = BotInstanceKey {
-                        channel_name: channel_name.to_string(),
-                        chat_id: chat_id.clone(),
-                        bot_name,
-                    };
-                    message_bus
-                        .dispatch(&key, IncomingMessage { content })
-                        .await?;
-                }
-                None => {
-                    error!("Failed to get or create bot for chat");
-                }
-            }
+            let incoming = parse_message_content(&msg.content);
+            let ingress_msg = IngressMessage {
+                channel_name: channel_name.to_string(),
+                chat_id: chat_id.clone(),
+                content: match incoming {
+                    IncomingContent::Text(text) => IngressContent::Text(text),
+                    IncomingContent::Command { name, args } => IngressContent::Command { name, args },
+                },
+            };
+            ingress.handle_message(ingress_msg).await;
         }
         "GROUP_AT_MESSAGE_CREATE" => {
             let msg: QqMessage = serde_json::from_value(data.clone())?;
@@ -818,43 +761,21 @@ async fn handle_event(
                 msg.group_openid.as_deref().unwrap_or("")
             ));
 
-            // Store message ID for passive reply
             {
                 let mut ids = recent_msg_ids.write().await;
                 ids.insert(chat_id.0.clone(), msg.id.clone());
             }
 
-            let content = parse_message_content(&msg.content);
-
-            // Check for /bot command
-            if let IncomingContent::Command {
-                name: cmd_name,
-                args,
-            } = &content
-                && cmd_name == "bot"
-            {
-                orchestrator
-                    .handle_bot_command(channel_name, &chat_id, args.clone())
-                    .await?;
-                return Ok(());
-            }
-
-            // Get or create bot and dispatch
-            match orchestrator.get_or_create(channel_name, &chat_id).await {
-                Some(bot_name) => {
-                    let key = BotInstanceKey {
-                        channel_name: channel_name.to_string(),
-                        chat_id: chat_id.clone(),
-                        bot_name,
-                    };
-                    message_bus
-                        .dispatch(&key, IncomingMessage { content })
-                        .await?;
-                }
-                None => {
-                    error!("Failed to get or create bot for chat");
-                }
-            }
+            let incoming = parse_message_content(&msg.content);
+            let ingress_msg = IngressMessage {
+                channel_name: channel_name.to_string(),
+                chat_id: chat_id.clone(),
+                content: match incoming {
+                    IncomingContent::Text(text) => IngressContent::Text(text),
+                    IncomingContent::Command { name, args } => IngressContent::Command { name, args },
+                },
+            };
+            ingress.handle_message(ingress_msg).await;
         }
         "READY" | "RESUMED" => {
             info!(event = %event_type, "QQ Bot session event");

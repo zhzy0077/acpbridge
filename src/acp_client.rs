@@ -611,7 +611,8 @@ where
     // Run everything in a LocalSet (required by SDK)
     let local_set = tokio::task::LocalSet::new();
 
-    local_set
+    let client_after_run = client.clone();
+    let result = local_set
         .run_until(async move {
             // Handle I/O in the background
             tokio::task::spawn_local(handle_io);
@@ -632,7 +633,7 @@ where
             loop {
                 tokio::select! {
                     _ = timeout_check_interval.tick() => {
-                        // 定期检查流式超时
+                        // Check whether an in-flight stream has gone idle.
                         client_for_loop.check_stream_timeout().await;
                     }
                     _ = sleep(Duration::from_secs(30)) => {
@@ -651,7 +652,7 @@ where
                                 ))
                                 .await;
 
-                            // 确保 prompt 结束后结束流式输出
+                            // Ensure each prompt closes any active stream on completion.
                             client_for_loop.end_streaming_if_active().await;
 
                             if let Err(e) = result {
@@ -681,7 +682,10 @@ where
                 }
             }
         })
-        .await
+        .await;
+
+    client_after_run.end_streaming_if_active().await;
+    result
 }
 
 /// Handle a command
@@ -945,9 +949,9 @@ struct AcpClient {
     state: Arc<AcpClientState>,
     /// Whether we're currently streaming a message (waiting to send StreamEnd)
     streaming: Arc<AtomicBool>,
-    /// 最后收到 chunk 的时间（用于超时检测）
+    /// Last time we received a chunk.
     last_chunk_time: Arc<Mutex<Instant>>,
-    /// 流式消息超时时间（60秒）
+    /// Stream inactivity timeout.
     stream_timeout: Duration,
 }
 
@@ -988,7 +992,7 @@ impl AcpClient {
         }
     }
 
-    /// 检查流式是否超时，如果超时则发送 StreamEnd
+    /// End an orphaned stream if the agent stops producing chunks.
     async fn check_stream_timeout(&self) {
         if self.streaming.load(Ordering::SeqCst) {
             let last_time = *self.last_chunk_time.lock().await;
@@ -999,7 +1003,7 @@ impl AcpClient {
         }
     }
 
-    /// 更新最后 chunk 时间
+    /// Update the timestamp of the last received chunk.
     async fn update_chunk_time(&self) {
         *self.last_chunk_time.lock().await = Instant::now();
     }

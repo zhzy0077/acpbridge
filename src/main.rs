@@ -1,12 +1,12 @@
 //! ACP Connector - Bridge between messaging platforms and ACP Agent CLI
 
 mod acp_client;
-mod bot;
+mod agent_session;
 mod channel;
 mod config;
-mod mcp_server;
-mod message_bus;
-mod orchestrator;
+mod egress;
+mod ingress;
+mod message;
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -18,7 +18,6 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<()> {
     init_logging();
 
-    // 1. Load configuration
     let config_path = std::env::var("ACP_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("config.yaml"));
@@ -37,30 +36,9 @@ async fn main() -> Result<()> {
         "Starting ACP Connector"
     );
 
-    // 2. Create MessageBus
-    let message_bus = Arc::new(message_bus::MessageBus::new());
+    let egress = Arc::new(egress::Egress::new());
+    let ingress = Arc::new(ingress::Ingress::new(config.clone(), egress.clone()));
 
-    // 3. Create Orchestrator
-    let mcp_port = config.mcp_server.as_ref().map(|m| m.port);
-    let orchestrator = Arc::new(orchestrator::Orchestrator::new(
-        config.clone(),
-        message_bus.clone(),
-        mcp_port,
-    ));
-
-    // 4. Start MCP Server if configured — bind eagerly so port conflicts fail at startup
-    if let Some(mcp_config) = &config.mcp_server {
-        let orch = orchestrator.clone();
-        let listener = mcp_server::bind_mcp_server(mcp_config.port).await?;
-        tokio::spawn(async move {
-            if let Err(e) = mcp_server::serve_mcp(listener, orch).await {
-                error!(error = %e, "MCP Server error");
-            }
-        });
-    }
-
-    // 5. Start all channels within a LocalSet
-    // This is required because Bot uses spawn_local for ACP client tasks
     let local_set = tokio::task::LocalSet::new();
 
     local_set
@@ -70,62 +48,51 @@ async fn main() -> Result<()> {
             for channel_config in &config.channels {
                 let channel_name = channel_config.name.clone();
 
-                // Create the platform-specific channel
                 let channel: Arc<dyn channel::Channel> = match &channel_config.platform {
                     config::PlatformConfig::Telegram { telegram } => {
-                        Arc::new(channel::TelegramChannel::new(
-                            telegram.token.clone(),
-                            channel_config.mention_only,
-                        ))
+                        Arc::new(channel::TelegramChannel::new(telegram.token.clone()))
                     }
                     config::PlatformConfig::Qq { qq } => Arc::new(channel::QqChannel::new(
                         qq.app_id.clone(),
                         qq.client_secret.clone(),
-                        channel_config.mention_only,
                     )),
                     config::PlatformConfig::Lark { lark } => Arc::new(channel::LarkChannel::new(
                         lark.app_id.clone(),
                         lark.app_secret.clone(),
                         lark.base_url.clone(),
-                        channel_config.mention_only,
                     )),
                     config::PlatformConfig::Wechat { wechat } => {
                         let wechat_config = channel::WeChatConfig::new(
                             wechat.bot_token.clone(),
                             Some(wechat.base_url.clone()),
                         );
-                        Arc::new(channel::WeChatChannel::new(
-                            wechat_config,
-                            channel_config.mention_only,
-                        ))
+                        Arc::new(channel::WeChatChannel::new(wechat_config))
                     }
                 };
 
-                let orch = orchestrator.clone();
-                let mb = message_bus.clone();
+                let ing = ingress.clone();
+                let eg = egress.clone();
                 let name = channel_name.clone();
 
                 let handle = tokio::spawn(async move {
-                    if let Err(e) = channel.start(name, orch, mb).await {
+                    if let Err(e) = channel.start(ing, eg, name).await {
                         error!(error = %e, channel = %channel_name, "Channel error");
                     }
                 });
                 handles.push(handle);
             }
 
-            // 6. Start idle cleanup task
-            let orch_cleanup = orchestrator.clone();
+            let ingress_cleanup = ingress.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
                 loop {
                     interval.tick().await;
-                    orch_cleanup
+                    ingress_cleanup
                         .cleanup_idle(std::time::Duration::from_secs(30 * 60))
                         .await;
                 }
             });
 
-            // 7. Wait for all channels
             for handle in handles {
                 if let Err(e) = handle.await {
                     error!(error = %e, "Channel task panicked");

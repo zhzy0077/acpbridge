@@ -136,7 +136,6 @@ ACP_CONFIG=/path/to/config.yaml ./target/release/acpbridge
 |-------|------|----------|-------------|
 | `name` | string | Yes | Unique channel identifier |
 | `telegram` / `qq` / `lark` / `wechat` | object | Yes* | Platform-specific config (*one required) |
-| `mention_only` | bool | No | Only respond when @mentioned in groups |
 | `default_bot` | string | Yes | Default bot for new chats |
 | `bots` | list | Yes | Available bots on this channel |
 

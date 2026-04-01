@@ -82,8 +82,8 @@ class LarkDebugger:
             print(f"   是否匹配: {'✅ 是' if is_mentioned else '❌ 否'}")
             
             if chat_type == "group":
-                print(f"\n📋 mention_only 逻辑分析:")
-                print(f"   mention_only=true 且 is_group=true 且 is_mentioned={is_mentioned}")
+                print(f"\n📋 群聊 mention 分析:")
+                print(f"   is_group=true 且 is_mentioned={is_mentioned}")
                 if is_mentioned:
                     print("   ✅ 结果: 消息会被处理")
                 else:
